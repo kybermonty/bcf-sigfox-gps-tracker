@@ -78,6 +78,17 @@ void gps_module_event_handler(bc_module_gps_event_t event, void *event_param)
     {
         bc_module_gps_get_position(&position);
 
+        bc_module_gps_accuracy_t accuracy;
+
+        if (bc_module_gps_get_accuracy(&accuracy))
+        {
+            if (accuracy.horizontal < 20.0)
+            {
+                // good position accuracy, stop gps
+                bc_scheduler_plan_now(0);
+            }
+        }
+
         bc_module_gps_invalidate();
     }
     else if (event == BC_MODULE_GPS_EVENT_ERROR)
