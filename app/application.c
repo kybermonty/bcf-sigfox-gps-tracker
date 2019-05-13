@@ -1,16 +1,20 @@
 #include <application.h>
+#include <math.h>
 
-bool running = false;
-bc_module_gps_position_t position;
+bool gps_running;
+bc_module_gps_position_t last_valid_position;
+bc_module_gps_position_t last_sent_position;
 bc_led_t led;
 bc_led_t gps_led_r;
 bc_led_t gps_led_g;
 bc_module_sigfox_t sigfox_module;
 
+static void charging_handler(void *param);
 void gps_module_event_handler(bc_module_gps_event_t event, void *event_param);
 void sigfox_module_event_handler(bc_module_sigfox_t *self, bc_module_sigfox_event_t event, void *event_param);
 void button_event_handler(bc_button_t *self, bc_button_event_t event, void *event_param);
 void gpsToBuffer(uint8_t *buf, float latitude, float longitude);
+float distance(float lat1, float lon1, float lat2, float lon2);
 
 void application_init(void)
 {
@@ -34,34 +38,71 @@ void application_init(void)
     static bc_button_t button;
     bc_button_init(&button, BC_GPIO_BUTTON, BC_GPIO_PULL_DOWN, false);
     bc_button_set_event_handler(&button, button_event_handler, NULL);
+
+    gps_running = false;
+    last_valid_position.latitude = 0;
+    last_valid_position.longitude = 0;
+    last_sent_position.latitude = 0;
+    last_sent_position.longitude = 0;
+
+    // LTC4150 Coulomb Counter
+    // POL
+    bc_gpio_init(BC_GPIO_P17);
+    bc_gpio_set_mode(BC_GPIO_P17, BC_GPIO_MODE_INPUT);
+    // INT
+    bc_gpio_init(BC_GPIO_P16);
+    bc_gpio_set_mode(BC_GPIO_P16, BC_GPIO_MODE_INPUT);
+    // VIO
+    bc_gpio_init(BC_GPIO_P15);
+    bc_gpio_set_mode(BC_GPIO_P15, BC_GPIO_MODE_OUTPUT);
+    bc_gpio_set_output(BC_GPIO_P15, 1);
+    // GND
+    bc_gpio_init(BC_GPIO_P14);
+    bc_gpio_set_mode(BC_GPIO_P14, BC_GPIO_MODE_OUTPUT);
+    bc_gpio_set_output(BC_GPIO_P14, 0);
+    // Periodically check polarity
+    bc_scheduler_register(charging_handler, NULL, 0);
 }
 
 void application_task(void)
 {
-    if (running)
+    if (last_valid_position.latitude != 0 && last_valid_position.longitude != 0 &&
+        (last_valid_position.latitude != last_sent_position.latitude ||
+        last_valid_position.longitude != last_sent_position.longitude) &&
+        (last_sent_position.latitude == 0 ||
+        distance(last_valid_position.latitude, last_valid_position.longitude,
+            last_sent_position.latitude, last_sent_position.longitude) > 100.0))
     {
-        bc_module_gps_stop();
-        running = false;
-
-        if (position.latitude != 0 && position.longitude != 0)
+        uint8_t buffer[8];
+        gpsToBuffer(buffer, last_valid_position.latitude, last_valid_position.longitude);
+        if (bc_module_sigfox_send_rf_frame(&sigfox_module, buffer, sizeof(buffer)))
         {
-            uint8_t buffer[8];
-            gpsToBuffer(buffer, position.latitude, position.longitude);
-            bc_module_sigfox_send_rf_frame(&sigfox_module, buffer, sizeof(buffer));
+            last_sent_position.latitude = last_valid_position.latitude;
+            last_sent_position.longitude = last_valid_position.longitude;
         }
-
-        bc_scheduler_plan_current_relative(5 * 60 * 1000);
+        else
+        {
+            bc_scheduler_plan_current_relative(10 * 1000);
+        }
     }
-    else
+
+    bc_scheduler_plan_current_relative(5 * 60 * 1000);
+}
+
+static void charging_handler(void *param)
+{
+    uint8_t polarity = bc_gpio_get_input(BC_GPIO_P17);
+    if (!gps_running && polarity)
     {
-        position.latitude = 0;
-        position.longitude = 0;
-
+        gps_running = true;
         bc_module_gps_start();
-        running = true;
-
-        bc_scheduler_plan_current_relative(60 * 1000);
     }
+    else if (gps_running && !polarity)
+    {
+        gps_running = false;
+        bc_module_gps_stop();
+    }
+    bc_scheduler_plan_current_relative(1000);
 }
 
 void gps_module_event_handler(bc_module_gps_event_t event, void *event_param)
@@ -76,17 +117,12 @@ void gps_module_event_handler(bc_module_gps_event_t event, void *event_param)
     }
     else if (event == BC_MODULE_GPS_EVENT_UPDATE)
     {
-        bc_module_gps_get_position(&position);
+        bc_module_gps_position_t position;
 
-        bc_module_gps_accuracy_t accuracy;
-
-        if (bc_module_gps_get_accuracy(&accuracy))
+        if (bc_module_gps_get_position(&position))
         {
-            if (accuracy.horizontal < 20.0)
-            {
-                // good position accuracy, stop gps
-                bc_scheduler_plan_now(0);
-            }
+            last_valid_position.latitude = position.latitude;
+            last_valid_position.longitude = position.longitude;
         }
 
         bc_module_gps_invalidate();
@@ -117,6 +153,8 @@ void button_event_handler(bc_button_t *self, bc_button_event_t event, void *even
 {
     if (event == BC_BUTTON_EVENT_PRESS)
     {
+        last_sent_position.latitude = 0;
+        last_sent_position.longitude = 0;
         bc_scheduler_plan_now(0);
     }
 }
@@ -138,4 +176,28 @@ void gpsToBuffer(uint8_t *buf, float latitude, float longitude)
 
     _intToBytes(buf, lat, 4);
     _intToBytes(buf + 4, lng, 4);
+}
+
+// https://www.movable-type.co.uk/scripts/latlong.html
+
+float deg2rad(float degrees)
+{
+    return degrees * 3.141592653589793238462643383279502884 / 180.0;
+}
+
+// Distance in meters between earth coordinates
+float distance(float lat1, float lon1, float lat2, float lon2)
+{
+    float earthRadiusKm = 6371;
+
+    float d_lat = deg2rad(lat2 - lat1);
+    float d_lon = deg2rad(lon2 - lon1);
+
+    lat1 = deg2rad(lat1);
+    lat2 = deg2rad(lat2);
+
+    float a = sinf(d_lat / 2) * sinf(d_lat / 2) +
+            sinf(d_lon / 2) * sinf(d_lon / 2) * cosf(lat1) * cosf(lat2);
+    float c = 2 * atan2f(sqrtf(a), sqrtf(1 - a));
+    return earthRadiusKm * c * 1000.0;
 }
